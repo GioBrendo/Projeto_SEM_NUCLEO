@@ -1,14 +1,17 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { CONFIG } from './config.js';
-import { sim, params, view, step, turnsRatio } from './physics.js';
+import { sim, params, view, step, turnsRatio, bInst, peakB, bOf, bRmsNow, curveNow, resetTemp } from './physics.js';
 import { renderer, scene, camera, controls, camFrom, camTo, fx, isSmall, render, resizeGL, setShadowQuality } from './scene.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { initFeatures, record, updateAudio, updateCamera, INFERNO_GLSL } from './features.js';
 import { matSteel, matCast, matCopper, matCoil, matBrass, matRubber, matPhen, matFloor, stripeBase, texN, texS, plateTexture } from './materials.js';
-const rbox = (w, h, d, r, s = 3) => new RoundedBoxGeometry(w, h, d, s, r);
+const rbox = (w, h, d, r, s = 3) => new RoundedBoxGeometry(w, h, d, s, r);   // arestas com bisel: captam highlights
 
-const { R, T } = CONFIG.disc;
+const { Rv:R, Tv:T, gap:GAP, mm:MM } = CONFIG.disc;
+const DISC_TXT = `Ø${Math.round(CONFIG.disc.R*200)} × ${+(CONFIG.disc.T*100).toFixed(1)} mm`;
+const DY = 0.75 - (T/2 + GAP);   // deslocamento axial: sem núcleo, a face do flange da bobina (0,75 no desenho de referência) desce até T/2 + folga
+const mmOf = u => Math.round(u*MM), BOLT = [3,4,5,6,8,10,12,16].find(b => b >= 0.18*MM);   // cotas das peças mecânicas em mm reais
 const C_AMBER = new THREE.Color(0xffb454), C_CYAN = new THREE.Color(0x63c7d6);
 
 /* ============================================================ geometry helpers */
@@ -36,14 +39,15 @@ class RectHelix extends THREE.Curve{
 
 const pickables = [];
 const PARTS = {
-  disc:  ['DISCO CONDUTOR','Cu · Ø250 x 5 mm · correntes de Foucault → calor'],
-  hub:   ['CUBO E FURAÇÃO','6 × M12 em Ø116 · chavetado ao eixo'],
-  shaft: ['EIXO DE ACIONAMENTO','Ø68 aço · 2 mancais de rolamento'],
-  coilA: ['BOBINA A (FRONTAL)','240 espiras Cu · 12 A ef. CA · ∥ ao disco'],
-  coilB: ['BOBINA B (TRASEIRA)','240 espiras Cu · em série (aditiva) · ∥ ao disco'],
+  disc:  ['DISCO CONDUTOR',`Cu · ${DISC_TXT} · correntes de Foucault → calor`],
+  hub:   ['CUBO E FURAÇÃO',`6 × M${BOLT} em Ø${mmOf(1.16)} · chavetado ao eixo`],
+  shaft: ['EIXO DE ACIONAMENTO',`Ø${mmOf(0.68)} aço · 2 mancais de rolamento`],
+  coilA: ['BOBINA A (FRONTAL)','240 espiras Cu · núcleo de ferro · 12 A ef. CA'],
+  coilB: ['BOBINA B (TRASEIRA)','240 espiras Cu · núcleo de ferro · em série (aditiva)'],
+  sup:   ['CULATRA DE FERRO',`retorno do fluxo (§3.2c) · folga de ${(GAP*MM).toFixed(0)} mm até o disco`],
+  core:  ['NÚCLEO POLAR DE FERRO',`μr ≫ 1 · entreferro de ${(GAP*MM).toFixed(0)} mm por lado`],
   ped:   ['MANCAL DE APOIO','rolamento · graxa vedada'],
   base:  ['BASE DE FIXAÇÃO','estrutura de aço soldada'],
-  supp:  ['SUPORTE DAS BOBINAS','pórtico em C · alumínio + fibra (não magnético) · fora do disco'],
   feed:  ['CAIXA DE ALIMENTAÇÃO CA','2 fios blindados · alimentação das bobinas'],
 };
 function tag(mesh, part){ mesh.userData.part = part; pickables.push(mesh); return mesh; }
@@ -88,6 +92,15 @@ function tag(mesh, part){ mesh.userData.part = part; pickables.push(mesh); retur
 }
 
 /* ============================================================ rotating groups */
+{ // culatra de ferro: coluna + 2 braços ligando os núcleos polares (caminho l_fe do §3.2c); o disco passa livre entre os polos
+  const m = matCast.clone(), ZA = (1.475 - DY) + 0.025 + 0.09;   // ZA: z dos braços, logo acima do flange externo de cada bobina
+  const col = tag(new THREE.Mesh(rbox(0.7, 5.4, 2*ZA + 0.3, 0.05), m), 'sup');
+  col.position.set(4.15, -2.35, 0); col.castShadow = col.receiveShadow = true; scene.add(col);
+  for (const s of [1, -1]){
+    const arm = tag(new THREE.Mesh(rbox(2.3, 0.5, 0.16, 0.03), m), 'sup');
+    arm.position.set(3.1, 0, s*ZA); arm.castShadow = arm.receiveShadow = true; scene.add(arm);
+  }
+}
 const shaftGroup = new THREE.Group(); scene.add(shaftGroup);
 {
   const shaft = tag(new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.34, 9, 28), matSteel.clone()), 'shaft');
@@ -130,7 +143,7 @@ const discMat = matCopper;
 const uHM = { value:0 }, uBase = { value:0 }, heatMats = [];
 const uHeat = { phi:{ value:0 }, om:{ value:0 }, eN:{ value:0 }, temp:{ value:28 }, trk:{ value:0 } };
 const JET = INFERNO_GLSL;   // paleta inferno (perceptualmente uniforme) no lugar do jet
-// Rastro analítico: a bobina fixa no mundo varre o disco a -phi; o ponto a "lag" rad atrás foi aquecido há lag/ω s
+// Rastro analítico: o polo fixo no mundo varre o disco a -phi; o ponto a "lag" rad atrás foi aquecido há lag/ω s
 // e decai com exp(-idade/τ). A soma de todas as voltas é uma série geométrica (forma fechada).
 const HEAT_GLSL = `
 float heatI(vec2 p){
@@ -171,7 +184,7 @@ for (const [flip, z, rx] of [[1, T/2 + CONFIG.heat.lift, 0], [-1, -T/2 - CONFIG.
 }
 
 /* ============================================================ coil units */
-const XP = CONFIG.poleX;                                // raio do eixo das bobinas (mundo, +x)
+const XP = CONFIG.poleX;                                // raio do eixo dos polos (mundo, +x)
 const coneGeo = new THREE.ConeGeometry(0.06, 0.17, 10);
 const ringGeo = (rad, tube, y, rs = 8, ts = 56)=>{
   const t = new THREE.TorusGeometry(rad, tube, rs, ts);
@@ -182,18 +195,22 @@ function buildUnit(){
   const u = { sign:1, group:new THREE.Group(), swirls:[], mix:1 };
   const g = u.group;
 
+  /* núcleo polar de ferro dentro de cada bobina; a culatra "sup" fecha o circuito, fora desta unidade */
+  for (const s of [1,-1]){ const z0 = T/2 + GAP, z1 = 1.475 - DY + 0.025, c = new THREE.Mesh(new THREE.CylinderGeometry(0.48, 0.48, z1 - z0, 36), matSteel.clone());
+    c.position.y = s*(z0 + z1)/2; c.castShadow = true; g.add(tag(c, 'core')); }
+
   /* bobinas A (à frente) e B (atrás): 3 camadas × 6 espiras, planos paralelos ao disco */
   u.coilMat = matCoil.clone();
   // cada anel representa N/M espiras; grade radial (L) × axial (K) dentro da janela de enrolamento; 240 esp. → 3×6 (projeto)
   const mk = (s, ex, n = 240)=>{ const M = Math.max(4, Math.round(18*n/240)), L = Math.max(1, Math.round(Math.sqrt(M*0.4))), K = Math.max(2, Math.round(M/L));
     const pr = L > 1 ? 0.17/(L-1) : 0, pz = 0.575/(K-1), rw = Math.min(0.038, 0.45*Math.min(pr || 1, pz)), gs = [];
-    for (let r=0;r<L;r++) for (let k=0;k<K;k++) gs.push(ringGeo(0.52 + (L > 1 ? pr*r : 0.085), rw + ex, s*(0.83 + pz*k), 8, 48));
+    for (let r=0;r<L;r++) for (let k=0;k<K;k++) gs.push(ringGeo(0.52 + (L > 1 ? pr*r : 0.085), rw + ex, s*(0.83 - DY + pz*k), 8, 48));
     return mergeGeometries(gs); };
   const coilA = tag(new THREE.Mesh(mk( 1,0), u.coilMat), 'coilA');
   const coilB = tag(new THREE.Mesh(mk(-1,0), u.coilMat), 'coilB');
   coilA.castShadow = coilB.castShadow = true; g.add(coilA, coilB);
   const fl = [];
-  for (const s of [1,-1]) for (const y of [0.775,1.475]){ const f = new THREE.CylinderGeometry(0.8,0.8,0.05,40); f.translate(0, s*y, 0); fl.push(f); }
+  for (const s of [1,-1]) for (const y of [0.775-DY,1.475-DY]){ const f = new THREE.CylinderGeometry(0.8,0.8,0.05,40); f.translate(0, s*y, 0); fl.push(f); }
   g.add(new THREE.Mesh(mergeGeometries(fl), matPhen));
 
   /* campo E nas bobinas: ao longo do fio, no sentido da corrente */
@@ -207,7 +224,7 @@ function buildUnit(){
 
   /* campo E induzido no disco: anéis em torno do eixo de B (faces e plano médio), E = −∂A/∂t */
   const eg = [];
-  for (const y of [0.27, 0, -0.27]) for (const rr of [0.28, 0.5, 0.72]) eg.push(ringGeo(rr, 0.022, y, 6, 72));
+  for (const y of [T/2+0.02, 0, -T/2-0.02]) for (const rr of [0.28, 0.5, 0.72]) eg.push(ringGeo(rr, 0.022, y, 6, 72));
   u.eTex = stripeBase.clone(); u.eTex.repeat.set(3,1);
   u.eMat = new THREE.MeshBasicMaterial({ color:0xc79bff, transparent:true, opacity:0,
     blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, alphaMap:u.eTex });
@@ -220,22 +237,20 @@ function buildUnit(){
   const tanV = new THREE.Vector3(-Math.sin(ARC), Math.cos(ARC), 0).normalize();
   const YUP = new THREE.Vector3(0,1,0);
   for (const face of [1,-1]) for (const dir of [1,-1]){
-    const w = new THREE.Group(); w.rotation.x = -Math.PI/2; w.position.set(0, face*0.3, dir*0.36);
+    const w = new THREE.Group(); w.rotation.x = -Math.PI/2; w.position.set(0, face*(T/2+0.04), dir*0.36);
     const arc = new THREE.Group();
     const tor = new THREE.Mesh(new THREE.TorusGeometry(0.30, 0.030, 8, 64, ARC), u.swirlMat);
     const cone = new THREE.Mesh(coneGeo, u.swirlMat);
     cone.position.set(0.30*Math.cos(ARC), 0.30*Math.sin(ARC), 0);
     cone.quaternion.setFromUnitVectors(YUP, tanV);
-    arc.add(tor, cone); arc.userData.dir = dir*face; arc.renderOrder = 3;
+    arc.add(tor, cone); arc.userData.dir = dir; arc.scale.y = dir; arc.renderOrder = 3;   // mesma circulação nas duas faces (J atravessa a espessura); a seta acompanha o giro
     w.add(arc); g.add(w); u.swirls.push(arc);
   }
 
-  /* campo B (bobinas sem núcleo): 9 circuitos fechados que atravessam as duas bobinas e o disco e retornam pelo ar, por fora das bobinas */
+  /* campo B: 9 linhas fechadas "de dipolo" (atravessam o furo das bobinas e o disco; voltam pelo ar) */
   const fg = [];
   for (const zk of [-0.3, 0, 0.3]) for (const xo of [-0.26, 0, 0.26]){
-    const rr = 1.55 + 0.4*(1 - Math.abs(xo)/0.26);   // linhas mais próximas do eixo fazem laços maiores (como num dipolo)
-    const pts = [[xo,1.2],[xo,0.55],[xo*1.5,0],[xo,-0.55],[xo,-1.2],[xo+0.55,-1.75],[0.8*rr,-1.95],[rr,-1.05],
-      [rr*1.02,0],[rr,1.05],[0.8*rr,1.95],[xo+0.55,1.75]].map(a=>new THREE.Vector3(a[0], a[1], zk));
+    const pts = [[xo,1.35],[xo*1.1,0.55],[xo*1.4,0],[xo*1.1,-0.55],[xo,-1.35],[0.55,-1.7],[1.15,-1.25],[1.45,0],[1.15,1.25],[0.55,1.7]].map(a=>new THREE.Vector3(a[0], a[1], zk));
     fg.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts, true, 'catmullrom', 0.65), 220, 0.024, 5, true));
   }
   u.fieldTex = stripeBase.clone(); u.fieldTex.repeat.set(3,1);
@@ -247,8 +262,8 @@ function buildUnit(){
   /* selos N / S nas faces polares (F = traseira, B = frontal) */
   const mkSprite = ()=>{ const s = new THREE.Sprite(new THREE.SpriteMaterial({ map:texN, transparent:true, opacity:0 }));
     s.scale.setScalar(0.52); s.userData = { pop:0, L:'N' }; s.renderOrder = 5; return s; };
-  u.sprF = mkSprite(); u.sprF.position.set(-0.95, -0.63, 0); g.add(u.sprF);
-  u.sprB = mkSprite(); u.sprB.position.set(-0.95,  0.63, 0); g.add(u.sprB);
+  u.sprF = mkSprite(); u.sprF.position.set(-0.95, -(T/2 + GAP + 0.1), 0); g.add(u.sprF);
+  u.sprB = mkSprite(); u.sprB.position.set(-0.95, T/2 + GAP + 0.1, 0); g.add(u.sprB);
   return u;
 }
 const unitA = buildUnit();
@@ -257,26 +272,9 @@ const units = [unitA];
 const uB = { value:0 };
 const bMat = new THREE.ShaderMaterial({ uniforms:{ uB }, transparent:true, depthWrite:false, side:THREE.DoubleSide,
   vertexShader:'varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }',
-  fragmentShader: JET + 'uniform float uB; varying vec2 vUv; void main(){ float r=length((vUv-.5)*2.6); float v=uB/(1.+pow(r/.73,6.)); gl_FragColor=vec4(pal(v),smoothstep(.02,.1,v)*.8); }' });
-const bMaps = [0.34,-0.34].map(z=>{ const m = new THREE.Mesh(new THREE.PlaneGeometry(2.6,2.6), bMat);
+  fragmentShader: JET + 'uniform float uB; varying vec2 vUv; void main(){ float r=length((vUv-.5)*2.6); float v=uB/(1.+pow(r/.68,6.)); gl_FragColor=vec4(pal(v),smoothstep(.02,.1,v)*.8); }' });
+const bMaps = [T/2+0.3*GAP, -T/2-0.3*GAP].map(z=>{ const m = new THREE.Mesh(new THREE.PlaneGeometry(2.6,2.6), bMat);
   m.position.set(XP,0,z); m.renderOrder = 3; scene.add(m); return m; });
-
-/* ---- suporte das bobinas: pórtico em C por fora do aro do disco; alumínio + fibra (não magnéticos, para não virar núcleo)
-   e sem espira condutora fechada em torno do eixo de B (a placa de fixação é de fibra; o laço das barras fica no plano y = 0, onde B_y = 0) ---- */
-{
-  const alu = new THREE.MeshStandardMaterial({ color:0x9aa3ad, metalness:0.8, roughness:0.42 });
-  const put = (geo, mat, x, y, z)=>{ const m = tag(new THREE.Mesh(geo, mat), 'supp'); m.position.set(x, y, z); m.castShadow = m.receiveShadow = true; scene.add(m); return m; };
-  const yTop = 0.9, yBot = -5.045;
-  put(rbox(0.5, yTop - yBot, 3.7, 0.05), alu, 4.1, (yTop + yBot)/2, 0);      // coluna
-  put(rbox(1.5, 0.22, 3.9, 0.05), alu, 4.1, yBot + 0.11, 0);                 // pé apoiado na base
-  const pg = new THREE.CylinderGeometry(0.8, 0.8, 0.2, 40); pg.rotateX(Math.PI/2);
-  const bolt = new THREE.CylinderGeometry(0.05, 0.05, 0.06, 10); bolt.rotateX(Math.PI/2);
-  for (const sz of [1, -1]){
-    put(pg, matPhen, XP, 0, sz*1.6);                                          // placa de fixação (encosta no flange externo, |z| = 1,5)
-    put(rbox(1.35, 0.8, 0.2, 0.03), alu, 3.525, 0, sz*1.6);                   // braço até a coluna
-    for (let k=0;k<4;k++){ const a = Math.PI/4 + k*Math.PI/2; put(bolt, matSteel.clone(), XP + 0.62*Math.cos(a), 0.62*Math.sin(a), sz*1.72); }
-  }
-}
 
 /* ---- AC feed cables + junction boxes ---- */
 const V3 = (x,y,z)=>new THREE.Vector3(x,y,z);
@@ -305,13 +303,13 @@ CONFIG.feedBoxX.forEach((x,i) => addFeedBox(x, 'ALIM. ' + 'AB'[i]));
 
 /* ============================================================ annotations */
 const ANNS = [
-  [-2.3,  1.3,  0.28, -1, 'DISCO CONDUTOR',      'Cu · Ø250 x 5 mm'],
-  [ 2.2,  0.75, 1.1,  -1, 'BOBINA A (FRONTAL)',  '240 esp. · Cu · CA · ∥ ao disco'],
-  [ 2.2, -0.75,-1.1,   1, 'BOBINA B (TRASEIRA)', 'em série · aditiva'],
-  [ 2.2, -0.72, 0.27, -1, 'CAMPO E NO DISCO',    'circula em torno de B · Faraday'],
-  [ 2.6,  0.0,  0.0,  -1, 'CAMPO B ⟂ AO DISCO',  'atravessa bobinas e disco'],
-  [ 4.1,  0.9,  0.0,   1, 'SUPORTE DAS BOBINAS', 'Al + fibra · não magnético'],
-  [ 0.15, 0.35, 4.25,  1, 'EIXO DE ACIONAMENTO', 'Ø68 · mancais de apoio'],
+  [-2.3,  1.3,  T/2, -1, 'DISCO CONDUTOR', `Cu · ${DISC_TXT}`],
+  [ 2.2,  0.75, 1.12-DY, -1, 'BOBINA A (FRONTAL)',  '240 esp. · Cu · CA · núcleo de ferro'],
+  [ 2.2, -0.75, -(1.12-DY), 1, 'BOBINA B (TRASEIRA)', 'em série · aditiva'],
+  [ 4.15, 0.5,  0.9,   1, 'CULATRA DE FERRO', 'fecha o circuito magnético'],
+  [ 2.2, -0.72, T/2+0.02, -1, 'CAMPO E NO DISCO',    'circula em torno de B · Faraday'],
+  [ 2.6,  0.0,  0.0,  -1, 'CAMPO B ⟂ AO DISCO',  'atravessa o núcleo, o entreferro e o disco'],
+  [ 0.15, 0.35, 4.25,  1, 'EIXO DE ACIONAMENTO', `Ø${mmOf(0.68)} · mancais de apoio`],
   [ 2.6, -4.40, 3.30,  1, 'ALIMENTAÇÃO CA',      '2 fios blindados'],
 ];
 const annEls = [];
@@ -352,7 +350,7 @@ function bindRange(el, out, fmt, setv){
 }
 bindRange(inRpm, oRpm, v=>`${v} rpm`,        v=>params.rpm = v);
 bindRange(inExc, oExc, v=>`${(v*12).toFixed(1)} A ef.`, v=>params.exc = v);
-const inTrn = $('inTrn'), oTrn = $('oTrn');
+const inTrn = $('inTrn'), oTrn =$('oTrn');
 bindRange(inTrn, oTrn, v=>`${v} esp.`, v=>params.turns = v);
 bindRange(inFrq, oFrq, v=>`${v.toFixed(1)} Hz`,    v=>params.freq = v);
 
@@ -382,16 +380,15 @@ $('tMotor').onchange = e => params.motor = e.target.checked;
 $('tHeat').onchange = e =>{ const on = e.target.checked; uHM.value = on ? 1 : 0;
   for (const m of heatMats){ m.blending = on ? THREE.NormalBlending : THREE.AdditiveBlending; m.needsUpdate = true; }
   $('lgH').style.display = on ? '' : 'none'; };
-$('tBmap').onchange = e =>{ bMaps.forEach(m => m.visible = e.target.checked); $('lgB').style.display = e.target.checked ? '' : 'none'; };
-$('tHeat').onchange({ target:$('tHeat') }); $('tBmap').onchange({ target:$('tBmap') });
+$('tBmap').onchange = e =>{ bMaps.forEach(m => m.visible = e.target.checked);$('lgB').style.display = e.target.checked ? '' : 'none'; };
+$('tHeat').onchange({ target:$('tHeat') });$('tBmap').onchange({ target:$('tBmap') });$('lgB').lastElementChild.lastElementChild.textContent = `${CONFIG.phys.bMax.toFixed(2).replace('.', ',')} T`;
 const SHQ = ['high','low','off'], SHL = { high:'ALTA', low:'BAIXA', off:'DESLIGADAS' };
 let shQ = isSmall ? 'low' : 'high';
-const applyShadow = q =>{ shQ = q; setShadowQuality(q); $('btnShadow').textContent = 'SOMBRAS: ' + SHL[q]; };
-$('btnShadow').onclick = ()=>applyShadow(SHQ[(SHQ.indexOf(shQ)+1)%3]);
+const applyShadow = q =>{ shQ = q; setShadowQuality(q); $('btnShadow').textContent = 'SOMBRAS: ' + SHL[q]; };$('btnShadow').onclick = ()=>applyShadow(SHQ[(SHQ.indexOf(shQ)+1)%3]);
 applyShadow(shQ);
 $('tBloom').onchange = e => fx.bloom = e.target.checked;
 $('tBloom').checked = fx.bloom = !isSmall;
-const pBody = $('pBody'), btnCol = $('btnCol');
+const pBody = $('pBody'), btnCol =$('btnCol');
 const mqSmall = matchMedia('(max-width:760px)');
 const setCol = hid =>{ pBody.classList.toggle('hidden', hid); btnCol.textContent = hid ? '+' : '–';
   btnCol.setAttribute('aria-expanded', String(!hid)); };
@@ -401,6 +398,9 @@ setCol(mqSmall.matches);
 
 const tbar = $('tbar'), segs = [];
 for (let i=0;i<16;i++){ const d = document.createElement('div'); d.className='seg'; tbar.appendChild(d); segs.push(d); }
+
+// Evento de clique para resetar a temperatura
+$('btnResetTemp').onclick = () => resetTemp();
 
 const rRpm=$('rRpm'), rTq=$('rTq'), rPw=$('rPw'), rI=$('rI'), rTmp=$('rTmp'), rTrk=$('rTrk'), rB=$('rB');
 const stDot=$('stDot'), stTxt=$('stTxt');
@@ -416,7 +416,7 @@ function sizeScope(){
   sctx.setTransform(d,0,0,d,0,0);
 }
 sizeScope();
-const scopeBuf = []; let tbScale = 20;
+const scopeBuf = []; let tbScale = 20*CONFIG.phys.scale;
 
 /* ============================================================ hover / tooltip */
 const tip = $('tip'), tipN = tip.querySelector('.t-n'), tipS = tip.querySelector('.t-s');
@@ -469,7 +469,7 @@ let matBuilt = 'Cu';
 let modeBuilt = 'ac';
 
 function updateDynamics(dt){
-  const nR = turnsRatio()*sim.sat;   // N·I efetivo após saturação
+  const nR = turnsRatio();   // N·I relativo (modelo linear, §3.2c)
   
   // Verifica se houve mudança nas espiras, material ou modo (CA/CC)
   if (turnsBuilt !== params.turns || matBuilt !== params.mat || modeBuilt !== params.mode){
@@ -483,21 +483,21 @@ function updateDynamics(dt){
     const modeStr = modeBuilt.toUpperCase();
 
     // 1. Atualiza as dicas (tooltips - PARTS) ao passar o mouse
-    PARTS.disc[1]  = `${matBuilt} · Ø250 x 5 mm · correntes de Foucault → calor`;
-    PARTS.coilA[1] = `${turnsBuilt} espiras Cu · 12 A ef. ${modeStr} · ∥ ao disco`;
-    PARTS.coilB[1] = `${turnsBuilt} espiras Cu · em série (aditiva) · ∥ ao disco`;
+    PARTS.disc[1]  = `${matBuilt} · ${DISC_TXT} · correntes de Foucault → calor`;
+    PARTS.coilA[1] = `${turnsBuilt} espiras Cu · núcleo de ferro · 12 A ef. ${modeStr}`;
+    PARTS.coilB[1] = `${turnsBuilt} espiras Cu · núcleo de ferro · em série (aditiva)`;
 
     // 2. Atualiza as anotações textuais flutuantes na tela (annEls)
     if (annEls.length > 2) {
       // annEls[0] é a anotação do DISCO CONDUTOR
-      annEls[0].el.querySelector('.s').textContent = `${matBuilt} · Ø250 x 5 mm`;
+      annEls[0].el.querySelector('.s').textContent = `${matBuilt} · ${DISC_TXT}`;
       // annEls[1] é a anotação da BOBINA A
-      annEls[1].el.querySelector('.s').textContent = `${turnsBuilt} esp. · Cu · ${modeStr} · ∥ ao disco`;
+      annEls[1].el.querySelector('.s').textContent = `${turnsBuilt} esp. · Cu · ${modeStr} · núcleo de ferro`;
     }
   }
   const aI  = Math.min(1, Math.abs(sim.I)/17), aB = Math.min(1, Math.abs(sim.I)*nR/17);   // aI: corrente; aB: campo (∝ N·I)
   const sgn = sim.I >= 0 ? 1 : -1;
-  const eN  = Math.min(1, Math.abs(sim.omega) * sim.uEff * nR / 8.3);
+  const eN  = Math.min(1, Math.abs(sim.omega)*sim.uEff*sim.uEff*nR*nR/25);   // /25: normalização visual (só visual; Ir² nominal = 1)
   sim.eN = eN;
   const dI = (sim.uEff > 0 && params.mode === 'ac') ? Math.cos(sim.theta) : 0;
   for (const u of units){
@@ -523,7 +523,7 @@ function updateDynamics(dt){
     poleUpdate(u.sprB, sim.I*u.sign <  0, aB, dt);
   }
   for (const m of feedLeds) m.emissiveIntensity = 0.15 + 2.6*Math.min(1, sim.uEff);
-  uB.value = Math.min(1, CONFIG.phys.bPerA/Math.SQRT2*Math.abs(sim.I)*turnsRatio()/CONFIG.bMapFull);
+  uB.value = Math.min(1, Math.abs(bOf(sim.I))/CONFIG.phys.bMax);   // fim da escala do mapa de B
   uBase.value = 0.4*Math.max(0, Math.min(1, (sim.temp-28)/272));
   uHeat.phi.value = sim.phi % (2*Math.PI); uHeat.om.value = sim.omega; uHeat.eN.value = sim.eN; uHeat.temp.value = sim.temp; uHeat.trk.value = Math.max(0, sim.tTrack - sim.temp);
   const heat = Math.max(0, Math.min(1, (sim.temp-60)/280))*(fx.bloom ? CONFIG.bloom.discGain : 1);
@@ -553,8 +553,35 @@ function drawScope(){
   const iS = Math.max(18, sim.Irms*1.6);
   trace(p => SH/2 - (Math.max(-iS,Math.min(iS,p.i))/iS)*(SH/2-4), 'rgba(255,180,84,0.92)', 1.4);
   let tbMax = 0; for (const p of scopeBuf) if (p.tb > tbMax) tbMax = p.tb;
-  tbScale += (Math.max(1, tbMax*1.1) - tbScale)*0.08;       // autoescala suavizada
+  tbScale += (Math.max(5*CONFIG.phys.scale, tbMax*1.1) - tbScale)*0.08;       // autoescala suavizada
   trace(p => SH-3 - Math.min(1, p.tb/tbScale)*(SH-10), 'rgba(154,162,171,0.85)', 1.2);
+}
+
+/* ---- curva T×ω (pesquisa §3.3, Wouterse): T = 2·Tmax·s/(1+s²), s = ω/ωc, com o ponto de operação ---- */
+const curve = $('curve'), cctx = curve.getContext('2d'), curveInfo =$('curveInfo');
+let CW = 0, CH = 0, cYmax = 0.3;
+function sizeCurve(){
+  const r = curve.getBoundingClientRect(), d = Math.min(2, devicePixelRatio||1);
+  CW = Math.max(10, r.width); CH = Math.max(10, r.height);
+  curve.width = CW*d; curve.height = CH*d; cctx.setTransform(d,0,0,d,0,0);
+}
+sizeCurve();
+function drawCurve(){
+  const { wc, tmax } = curveNow(), wa = Math.abs(sim.omega), wMax = Math.max(2.5*wc, 1.1*wa, 1.1*params.rpm*Math.PI/30);
+  cYmax += (Math.max(tmax, 1e-3)*1.15 - cYmax)*0.15;
+  const X = w => 6 + w/wMax*(CW-12), Y = t => CH-14 - Math.min(1, t/cYmax)*(CH-24);
+  cctx.clearRect(0,0,CW,CH); cctx.lineWidth = 1;
+  cctx.strokeStyle = 'rgba(255,255,255,0.10)'; cctx.beginPath(); cctx.moveTo(0,CH-14.5); cctx.lineTo(CW,CH-14.5); cctx.stroke();
+  cctx.setLineDash([3,3]); cctx.strokeStyle = 'rgba(99,199,214,0.7)';
+  cctx.beginPath(); cctx.moveTo(X(wc),4); cctx.lineTo(X(wc),CH-14); cctx.stroke(); cctx.setLineDash([]);
+  cctx.strokeStyle = 'rgba(255,180,84,0.92)'; cctx.lineWidth = 1.4; cctx.beginPath();
+  for (let n=0;n<=80;n++){ const w = wMax*n/80, s = w/wc, y = Y(2*tmax*s/(1+s*s)); n ? cctx.lineTo(X(w),y) : cctx.moveTo(X(w),y); }
+  cctx.stroke();
+  cctx.fillStyle = '#fff'; cctx.beginPath(); cctx.arc(X(wa), Y(Math.abs(sim.Tb)), 3.2, 0, 7); cctx.fill();
+  cctx.fillStyle = '#8e939a'; cctx.font = '9px monospace';
+  cctx.fillText('0', 6, CH-3); cctx.fillText(Math.round(wMax*9.5493) + ' rpm', CW-48, CH-3);
+  cctx.fillStyle = 'rgba(99,199,214,0.95)'; cctx.fillText('ωc', Math.min(CW-18, X(wc)+3), 11);
+  setT(curveInfo, `ωc ${Math.round(wc*9.5493)} rpm · Tmáx ${tmax.toFixed(2)} N·m · ${wa < wc ? 'resistivo: T ∝ ω' : 'indutivo: T ∝ 1/ω'}`);
 }
 
 /* ---- HUD ---- */
@@ -562,19 +589,18 @@ const setT = (el, v)=>{ if (el._t !== v){ el._t = v; el.textContent = v; } };   
 const setC = (el, v)=>{ if (el._c !== v){ el._c = v; el.className = v; } };
 function updateHUD(){
   setT(rRpm, (sim.omega < -0.2 ? '−' : '') + String(Math.round(Math.abs(sim.omega)*9.5493)).padStart(4,'0'));
-  setT(rTq, Math.abs(sim.Tb).toFixed(1));
-  setT(rPw, (sim.P/1000).toFixed(2));
+  setT(rTq, Math.abs(sim.Tb).toFixed(2));
+  setT(rPw, Math.round(sim.P).toString());
   setT(rI, sim.Irms.toFixed(1)); setC(rI, sim.Irms > 12.5 ? 'hot' : '');
-  setT(rB, (CONFIG.phys.bPerA*sim.Irms*turnsRatio()*1000).toFixed(1));
+  setT(rB, peakB().toFixed(3));
   setT(rTmp, String(Math.round(sim.temp)));
   setC(rTmp, sim.temp > 180 ? 'hot' : '');
   setT(rTrk, String(Math.round(sim.tTrack))); setC(rTrk, sim.tTrack > 250 ? 'hot' : '');
   const n = Math.round(Math.max(0, Math.min(1, (sim.tTrack-28)/312))*16);
   segs.forEach((el,i)=> setC(el, 'seg' + (i<n ? ' lit' : '') + (i<n && i>=12 ? ' r' : '')));
   let st = 'PRONTO', cls = '';
-  if (sim.trip){ st = 'SUPERAQUECIDO · RESFRIANDO'; cls = 'err'; }
-  else if (sim.Irms > 0.3 && Math.abs(sim.omega) < 2){ st = 'EIXO PARADO'; cls = 'on'; }
-  else if (sim.Irms > 0.3 && Math.abs(sim.Tb) > 3){ st = 'FRENANDO'; cls = 'on'; }
+  if (sim.Irms > 0.3 && Math.abs(sim.omega) < 2){ st = 'EIXO PARADO'; cls = 'on'; }
+  else if (sim.Irms > 0.3 && Math.abs(sim.Tb) > 3*CONFIG.phys.scale){ st = 'FRENANDO'; cls = 'on'; }
   else if (Math.abs(sim.omega) > 2){ st = 'EM ROTAÇÃO'; cls = 'run'; }
   setT(stTxt, st); setC(stDot, 'dot ' + cls);
 }
@@ -627,7 +653,7 @@ function frame(){
     step(CONFIG.sim.dt); acc -= CONFIG.sim.dt; n++;
     if (scopeBuf.length && scopeBuf[scopeBuf.length-1].t > sim.t) scopeBuf.length = 0;   // reset → limpa o traço
     record();
-    const r = sim.Irms > 0.01 ? sim.I/sim.Irms : 0;          // torque instantâneo ∝ I²: média = Tb, pico = 2·Tb
+    const bq = bRmsNow(), r = bq > 1e-6 ? bOf(sim.I)/bq : 0;   // torque instantâneo ∝ B(t)²: média = Tb (linear, pico = 2·Tb em CA)
     scopeBuf.push({ t:sim.t, i:sim.I, tb:Math.abs(sim.Tb)*r*r });
   }
   if (n === CONFIG.sim.maxSteps) acc = 0;
@@ -638,7 +664,7 @@ function frame(){
   updateAudio(); updateCamera(dt);
 
   while (scopeBuf.length && scopeBuf[0].t < sim.t-5.3) scopeBuf.shift();
-  drawScope();
+  drawScope(); drawCurve();
 
   hudAcc += dt; if (hudAcc > CONFIG.hudEvery){ hudAcc = 0; updateHUD(); }
 
@@ -651,7 +677,7 @@ addEventListener('resize', ()=>{
   camera.aspect = innerWidth/innerHeight;
   camera.updateProjectionMatrix();
   resizeGL();
-  sizeSvg(); sizeScope();
+  sizeSvg(); sizeScope(); sizeCurve();
 });
 
 initFeatures();

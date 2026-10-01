@@ -93,7 +93,7 @@ input[type=range]::-moz-range-progress{background:var(--amber);height:3px;border
 #tbar .seg{flex:1;height:5px;border-radius:2px;background:#24272b}
 #tbar .seg.lit{background:var(--amber)}
 #tbar .seg.lit.r{background:var(--red)}
-#scope{width:100%;height:96px;display:block;background:rgba(0,0,0,.28);border:1px solid var(--line2);border-radius:6px}
+#scope,#curve{width:100%;height:96px;display:block;background:rgba(0,0,0,.28);border:1px solid var(--line2);border-radius:6px}
 .leg{display:flex;gap:16px;margin-top:7px;font:400 9px var(--mono);color:var(--dim)}
 .leg i{display:inline-block;width:12px;height:2px;vertical-align:3px;margin-right:5px}
 .leg .sa{background:var(--amber2)} .leg .sb{background:#9aa2ab}
@@ -141,7 +141,8 @@ input:disabled{opacity:.35}
   <div class="tag">BOBINAS CA GÊMEAS · RETARDADOR</div>
   <ul class="specs">
     <li><span>DISCO</span><em>Cu · Ø250 × 5 mm</em></li>
-    <li><span>BOBINAS</span><em>2 × 2500 esp. · CA 0–12 A ef.</em></li>
+    <li><span>NÚCLEO</span><em>ferro · culatra em C</em></li>
+    <li><span>BOBINAS</span><em>2 × 240 esp. · CA 0–12 A ef.</em></li>
     <li><span>LEI</span><em>e = −dΦ/dt · Lenz</em></li>
   </ul>
 </div>
@@ -191,12 +192,13 @@ input:disabled{opacity:.35}
     <section class="sec">
       <h3>INDICADORES</h3>
       <div class="irow"><span>velocidade do disco</span><b><em id="rRpm">0000</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> rpm</i></b></div>
-      <div class="irow"><span>torque de frenagem</span><b><em id="rTq">0.0</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> N·m</i></b></div>
-      <div class="irow"><span>potência de frenagem</span><b><em id="rPw">0.0</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> kW</i></b></div>
+      <div class="irow"><span>torque de frenagem</span><b><em id="rTq">0.00</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> N·m</i></b></div>
+      <div class="irow"><span>potência de frenagem</span><b><em id="rPw">0</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> W</i></b></div>
       <div class="irow"><span>corrente na bobina</span><b><em id="rI">0.0</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> A ef.</i></b></div>
-      <div class="irow"><span>B pico no disco (bobinas de ar)</span><b><em id="rB">0.0</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> mT</i></b></div>
+      <div class="irow"><span>B pico no disco (estim.)</span><b><em id="rB">0.00</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> T</i></b></div>
       <div class="irow"><span>temp. do disco</span><b><em id="rTmp">28</em><i id="rTmpU" style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> °C</i></b></div>
-      <div class="irow"><span>temp. da trilha (sob as bobinas)</span><b><em id="rTrk">28</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> °C</i></b></div>
+      <div class="irow"><span>temp. da trilha (sob os polos)</span><b><em id="rTrk">28</em><i style="font:inherit;font-size:9px;color:var(--dim);font-style:normal"> °C</i></b></div>
+      <button class="mini" type="button" id="btnResetTemp" style="width:100%;margin-top:8px">REPOR TEMPERATURA</button>
       <div id="tbar"></div>
     </section>
     <section class="sec">
@@ -205,13 +207,18 @@ input:disabled{opacity:.35}
       <div class="leg"><span><i class="sa"></i>I(t) — corrente na bobina</span><span><i class="sb"></i>T(t) — <b id="lgT" style="font-weight:400">torque · 2f</b></span></div>
     </section>
     <section class="sec">
+      <h3>CURVA T × ω · MODELO DE WOUTERSE</h3>
+      <canvas id="curve"></canvas>
+      <div class="mi" id="curveInfo"></div>
+    </section>
+    <section class="sec">
       <h3>VISUALIZAÇÃO</h3>
       <label class="tg"><span>campo magnético B (linhas)</span><input id="tField" type="checkbox" checked><i></i></label>
       <label class="tg"><span>campo elétrico E (bobinas e disco)</span><input id="tEfld" type="checkbox" checked><i></i></label>
       <label class="tg"><span>correntes parasitas J (giros)</span><input id="tSwirl" type="checkbox" checked><i></i></label>
       <label class="tg"><span>mapa de calor (disco)</span><input id="tHeat" type="checkbox" checked><i></i></label>
       <div class="lg" id="lgH"><i></i><div><span>frio</span><span>quente</span></div></div>
-      <label class="tg"><span>mapa de campo B (|B| nas faces do disco)</span><input id="tBmap" type="checkbox" checked><i></i></label>
+      <label class="tg"><span>mapa de campo B (|B| na folga bobina–disco)</span><input id="tBmap" type="checkbox" checked><i></i></label>
       <div class="lg" id="lgB"><i></i><div><span>0 T</span><span>0,8 T</span></div></div>
       <label class="tg"><span>legendas</span><input id="tLabels" type="checkbox" checked><i></i></label>
       <label class="tg"><span>som (zumbido CA + rotação)</span><input id="tSound" type="checkbox"><i></i></label>
